@@ -61,7 +61,6 @@ class FocusAreaManager(QObject):
     ) -> None:
         super().__init__(parent)
         self._areas: dict[AreaId, FocusArea] = {}
-        self._navigation_blocked = False
         self._navigation_guard = navigation_guard or (lambda: True)
         self._transitioning = False
         self._pending_area: AreaId | None = None
@@ -90,6 +89,9 @@ class FocusAreaManager(QObject):
             order=order,
             default_target_id=default_target_id,
             fallback_target_ids=fallback_target_ids,
+        )
+        root.destroyed.connect(
+            lambda _obj=None, area_id=area_id: self.unregister_area(area_id)
         )
 
     def unregister_area(self, area_id: AreaId) -> None:
@@ -145,9 +147,6 @@ class FocusAreaManager(QObject):
         area.active = active
         self.availabilityChanged.emit(area_id, self.is_area_available(area_id))
 
-    def set_navigation_blocked(self, blocked: bool) -> None:
-        self._navigation_blocked = blocked
-
     def is_area_available(self, area_id: AreaId) -> bool:
         area = self._areas.get(area_id)
         if area is None or not area.available or not area.active:
@@ -198,7 +197,7 @@ class FocusAreaManager(QObject):
         self.unregister_target(area_id, target_id)
 
     def _navigate(self, direction: int) -> bool:
-        if self._navigation_blocked or not self._navigation_guard():
+        if self._transitioning or not self._navigation_guard():
             return False
         app = QApplication.instance()
         focus = app.focusWidget() if app is not None else None
@@ -211,18 +210,19 @@ class FocusAreaManager(QObject):
         target_area_id = self._find_available(current.area_id, direction)
         if target_area_id is None:
             return False
-        area = self._areas[target_area_id]
-        target_id, target, widget = self._target_to_focus(area)
-        if widget is None:
-            return False
-        if widget is focus:
-            self._set_current_area(target_area_id)
-            return True
-
         self._pending_area = target_area_id
-        self.focusTransitionRequested.emit(current.area_id, target_area_id)
         self._transitioning = True
         try:
+            self.focusTransitionRequested.emit(current.area_id, target_area_id)
+            area = self._areas.get(target_area_id)
+            if area is None or not self.is_area_available(target_area_id):
+                return False
+            target_id, target, widget = self._target_to_focus(area)
+            if widget is None:
+                return False
+            if widget is focus:
+                self._set_current_area(target_area_id)
+                return True
             widget.setFocus(Qt.FocusReason.ShortcutFocusReason)
             app = QApplication.instance()
             actual_focus = app.focusWidget() if app is not None else None
@@ -282,7 +282,16 @@ class FocusAreaManager(QObject):
             return None
         try:
             widget = target.resolver()
-            if widget is None or not widget.isVisible() or not widget.isEnabled():
+        except (RuntimeError, ReferenceError):
+            self.unregister_target(area.area_id, target_id)
+            return None
+        if widget is None:
+            return None
+        if not isinstance(widget, QWidget):
+            self.unregister_target(area.area_id, target_id)
+            return None
+        try:
+            if not widget.isVisible() or not widget.isEnabled():
                 return None
             if widget.focusPolicy() == Qt.FocusPolicy.NoFocus:
                 return None
@@ -291,14 +300,15 @@ class FocusAreaManager(QObject):
             if target.available is not None and not target.available():
                 return None
             return widget
-        except RuntimeError:
+        except (RuntimeError, ReferenceError):
+            self.unregister_target(area.area_id, target_id)
             return None
 
     def _target_for_widget(
         self, area: FocusArea, widget: QWidget
     ) -> tuple[TargetId, FocusTarget, QWidget] | None:
         matches: list[tuple[int, TargetId, FocusTarget, QWidget]] = []
-        for target_id, target in area.targets.items():
+        for target_id, target in tuple(area.targets.items()):
             target_widget = self._resolve_area_target(area, target_id)
             if target_widget is None:
                 continue

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from PyQt6.QtCore import QEvent, Qt, pyqtSignal
+from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction, QInputMethodEvent
 from PyQt6.QtWidgets import (
     QApplication,
@@ -57,20 +57,14 @@ class _LineEditStateAdapter:
 
 
 class _ImeAwareLineEdit(QLineEdit):
-    compositionStateChanged = pyqtSignal(bool)
-
     def __init__(self, accessible_name: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setAccessibleName(accessible_name)
-        self._composition_active = False
+        self.setProperty("imeCompositionActive", False)
 
     def inputMethodEvent(self, event: QInputMethodEvent) -> None:
         super().inputMethodEvent(event)
-        active = bool(event.preeditString())
-        if active != self._composition_active:
-            self._composition_active = active
-            self.setProperty("imeCompositionActive", active)
-            self.compositionStateChanged.emit(active)
+        self.setProperty("imeCompositionActive", bool(event.preeditString()))
 
 
 class MainWindow(QMainWindow):
@@ -164,8 +158,6 @@ class MainWindow(QMainWindow):
     def _connect_ui(self) -> None:
         self.slide_list.currentRowChanged.connect(self._on_slide_changed)
         self.object_tree.currentItemChanged.connect(self._on_object_changed)
-        for editor in self.property_fields.values():
-            editor.compositionStateChanged.connect(self._on_composition_changed)
 
     def _create_navigation_actions(self) -> None:
         menu = self.menuBar().addMenu("Navigace")
@@ -234,12 +226,6 @@ class MainWindow(QMainWindow):
         for field_id, editor in self.property_fields.items():
             editor.setEnabled(item is not None)
             editor.setText(values[field_id])
-
-    def _on_composition_changed(self, _active: bool) -> None:
-        focus = self.focusWidget()
-        self.manager.set_navigation_blocked(
-            bool(focus and focus.property("imeCompositionActive"))
-        )
 
     def _navigation_allowed(self) -> bool:
         if QApplication.activeModalWidget() is not None:

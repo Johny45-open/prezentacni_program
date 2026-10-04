@@ -6,6 +6,7 @@ import unittest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import QCoreApplication, QEvent, Qt
+from PyQt6.QtGui import QInputMethodEvent
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QLineEdit, QVBoxLayout, QWidget
 
@@ -108,6 +109,114 @@ class FocusAreaManagerTests(unittest.TestCase):
         self.key(self.window.slide_list, Qt.Key.Key_F6)
         self.assertEqual(len(transitions), 1)
         self.assertIs(self.window.focusWidget(), self.window.object_tree)
+
+    def test_synchronous_reentrant_navigation_is_rejected(self) -> None:
+        transitions: list[tuple[object, object]] = []
+        nested_results: list[bool] = []
+
+        def reenter(source: object, destination: object) -> None:
+            transitions.append((source, destination))
+            nested_results.append(self.window.manager.navigate_previous())
+
+        self.window.manager.focusTransitionRequested.connect(reenter)
+        self.window.slide_list.setFocus()
+        self.assertTrue(self.window.manager.navigate_next())
+        self.assertEqual(len(transitions), 1)
+        self.assertEqual(nested_results, [False])
+        self.assertIs(self.window.focusWidget(), self.window.object_tree)
+        self.assertFalse(self.window.manager._transitioning)
+
+    def _send_preedit(self, editor: QLineEdit, text: str) -> None:
+        QApplication.sendEvent(editor, QInputMethodEvent(text, []))
+        self.app.processEvents()
+
+    def test_ime_preedit_blocks_navigation_until_composition_ends(self) -> None:
+        editor = self.window.property_fields["text"]
+        editor.setFocus()
+        self._send_preedit(editor, "kana")
+        self.assertTrue(editor.property("imeCompositionActive"))
+        self.assertFalse(self.window.manager.navigate_next())
+        self._send_preedit(editor, "kanji")
+        self.assertTrue(editor.property("imeCompositionActive"))
+        self.assertFalse(self.window.manager.navigate_next())
+        self._send_preedit(editor, "")
+        self.assertFalse(editor.property("imeCompositionActive"))
+        self.assertTrue(self.window.manager.navigate_next())
+        self.assertIs(self.window.focusWidget(), self.window.slide_list)
+
+    def test_stale_ime_state_on_old_widget_does_not_block_new_focus(self) -> None:
+        editor = self.window.property_fields["text"]
+        editor.setFocus()
+        self._send_preedit(editor, "kana")
+        self.assertTrue(editor.property("imeCompositionActive"))
+        self.window.object_tree.setFocus()
+        self.app.processEvents()
+        self.assertIs(self.window.focusWidget(), self.window.object_tree)
+        self.assertTrue(editor.property("imeCompositionActive"))
+        self.key(self.window.object_tree, Qt.Key.Key_F6)
+        self.assertIs(self.window.focusWidget(), editor)
+
+    def test_destroyed_root_area_is_unregistered_and_skipped(self) -> None:
+        host = QWidget()
+        host.setLayout(QVBoxLayout())
+        source_root = QWidget(host)
+        source_root.setLayout(QVBoxLayout())
+        source = QLineEdit(source_root)
+        source_root.layout().addWidget(source)
+        destination_root = QWidget(host)
+        destination_root.setLayout(QVBoxLayout())
+        destination = QLineEdit(destination_root)
+        destination_root.layout().addWidget(destination)
+        host.layout().addWidget(source_root)
+        host.layout().addWidget(destination_root)
+        host.show()
+        manager = FocusAreaManager()
+        manager.register_area("source", source_root, 0, "source")
+        manager.register_target("source", "source", source)
+        manager.register_area("destination", destination_root, 1, "destination")
+        manager.register_target("destination", "destination", destination)
+        source.setFocus()
+        self.app.processEvents()
+        destination_root.deleteLater()
+        QCoreApplication.sendPostedEvents(destination_root, QEvent.Type.DeferredDelete)
+        self.app.processEvents()
+        self.assertIsNone(manager.next_available("source"))
+        self.assertFalse(manager.navigate_next())
+        self.assertIs(self.app.focusWidget(), source)
+        host.close()
+
+    def test_resolver_returning_destroyed_target_uses_fallback(self) -> None:
+        host = QWidget()
+        host.setLayout(QVBoxLayout())
+        source_root = QWidget(host)
+        source_root.setLayout(QVBoxLayout())
+        source = QLineEdit(source_root)
+        source_root.layout().addWidget(source)
+        destination_root = QWidget(host)
+        destination_root.setLayout(QVBoxLayout())
+        fallback = QLineEdit(destination_root)
+        doomed = QLineEdit(destination_root)
+        destination_root.layout().addWidget(fallback)
+        destination_root.layout().addWidget(doomed)
+        host.layout().addWidget(source_root)
+        host.layout().addWidget(destination_root)
+        host.show()
+        manager = FocusAreaManager()
+        manager.register_area("source", source_root, 0, "source")
+        manager.register_target("source", "source", source)
+        manager.register_area("destination", destination_root, 1, "fallback")
+        manager.register_target("destination", "fallback", fallback)
+        manager.register_target("destination", "dynamic", lambda: doomed)
+        doomed.setFocus()
+        self.app.processEvents()
+        source.setFocus()
+        self.app.processEvents()
+        doomed.deleteLater()
+        QCoreApplication.sendPostedEvents(doomed, QEvent.Type.DeferredDelete)
+        self.app.processEvents()
+        self.assertTrue(manager.navigate_next())
+        self.assertIs(self.app.focusWidget(), fallback)
+        host.close()
 
     def test_selection_change_does_not_move_keyboard_focus(self) -> None:
         self.window.object_tree.setFocus()
